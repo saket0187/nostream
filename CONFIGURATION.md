@@ -210,7 +210,7 @@ The settings below are listed in alphabetical order by name. Please keep this ta
 | nip05.domainBlacklist                       | List of domains blocked from NIP-05 verification. Authors with NIP-05 at these domains will be rejected. |
 | nip05.domainWhitelist                       | List of domains allowed for NIP-05 verification. If set, only authors verified at these domains can publish. |
 | nip05.maxConsecutiveFailures                | Number of consecutive verification failures before giving up on an author. Defaults to 20. |
-| nip05.mode                                  | NIP-05 verification mode: `enabled` requires verification, `passive` verifies without blocking, `disabled` does nothing. Defaults to `disabled`. |
+| nip05.mode                                  | NIP-05 verification mode: `enabled` requires verification, `passive` verifies without blocking, `disabled` does nothing. Defaults to `disabled`. Verification requests go out directly over HTTPS and ignore `HTTPS_PROXY` and Node's `NODE_USE_ENV_PROXY`, so the relay needs direct outbound HTTPS; a domain or redirect target that resolves to a loopback, private or link-local address is not contacted. |
 | nip05.verifyExpiration                      | Time in milliseconds before a successful NIP-05 verification expires and needs re-checking. Defaults to 604800000 (1 week). |
 | nip05.verifyUpdateFrequency                 | Minimum interval in milliseconds between re-verification attempts for a given author. Defaults to 86400000 (24 hours). |
 | nip42.authRequired                          | When true, clients must NIP-42 AUTH as the event author before publishing events. Advertised in NIP-11 as `limitation.restricted_writes` (not `auth_required`, which means AUTH before any connection action). Defaults to false. |
@@ -278,7 +278,7 @@ The settings below are listed in alphabetical order by name. Please keep this ta
 | nip05.domainBlacklist                       | List of domains blocked from NIP-05 verification. Authors with NIP-05 at these domains will be rejected. |
 | nip05.domainWhitelist                       | List of domains allowed for NIP-05 verification. If set, only authors verified at these domains can publish. |
 | nip05.maxConsecutiveFailures                | Number of consecutive verification failures before giving up on an author. Defaults to 20. |
-| nip05.mode                                  | NIP-05 verification mode: `enabled` requires verification, `passive` verifies without blocking, `disabled` does nothing. Defaults to `disabled`. |
+| nip05.mode                                  | NIP-05 verification mode: `enabled` requires verification, `passive` verifies without blocking, `disabled` does nothing. Defaults to `disabled`. Verification requests go out directly over HTTPS and ignore `HTTPS_PROXY` and Node's `NODE_USE_ENV_PROXY`, so the relay needs direct outbound HTTPS; a domain or redirect target that resolves to a loopback, private or link-local address is not contacted. |
 | nip05.verifyExpiration                      | Time in milliseconds before a successful NIP-05 verification expires and needs re-checking. Defaults to 604800000 (1 week). |
 | nip05.verifyUpdateFrequency                 | Minimum interval in milliseconds between re-verification attempts for a given author. Defaults to 86400000 (24 hours). |
 | paymentProcessors.lnbits.baseURL            | Base URL of your LNbits instance. |
