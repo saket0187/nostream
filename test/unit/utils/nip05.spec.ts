@@ -1,3 +1,8 @@
+import dns from 'node:dns'
+import http from 'node:http'
+import https from 'node:https'
+import { AddressInfo, createServer as createTcpServer, isIP, Server as TcpServer } from 'node:net'
+import tls from 'node:tls'
 import axios from 'axios'
 import chai from 'chai'
 import chaiAsPromised from 'chai-as-promised'
@@ -303,6 +308,34 @@ describe('NIP-05 utils', () => {
         rejects('https://169.254.169.254/latest/meta-data/')
       })
 
+      it('judges IPv4 literals against the shared blocklist', () => {
+        const isRefused = (host: string) => {
+          try {
+            guard({ href: `https://${host}/.well-known/nostr.json?name=alice` })
+            return false
+          } catch {
+            return true
+          }
+        }
+        const hosts = ['100.100.100.200', '100.64.0.1', '192.0.0.1', '198.18.0.1', '203.0.113.1', '8.8.8.8']
+
+        expect(Object.fromEntries(hosts.map((host) => [host, isRefused(host)]))).to.deep.equal({
+          '100.100.100.200': true,
+          '100.64.0.1': true,
+          '192.0.0.1': true,
+          '198.18.0.1': true,
+          '203.0.113.1': true,
+          '8.8.8.8': false,
+        })
+      })
+
+      it('names only the scheme and host of a refused target', () => {
+        expect(() => guard({ href: 'https://user:secret@100.100.100.200:8443/meta?sig=token' })).to.throw(
+          /^refused redirect to unsafe target: https:\/\/100\.100\.100\.200:8443$/,
+        )
+        expect(() => guard({ href: 'not a url' })).to.throw(/^refused redirect to unsafe target: an invalid URL$/)
+      })
+
       it('rejects redirects to localhost hostname', () => {
         rejects('https://localhost/')
         rejects('https://foo.localhost/')
@@ -311,6 +344,204 @@ describe('NIP-05 utils', () => {
       it('rejects redirects to IPv6 literals', () => {
         rejects('https://[::1]/')
       })
+    })
+  })
+
+  describe('verifyNip05Identifier over a real connection', () => {
+    const pubkey = PUBKEY_A
+    const publicAddresses = [
+      { address: '2606:4700::1', family: 6 },
+      { address: '8.8.8.8', family: 4 },
+    ]
+    const refused = (host: string) => ({
+      status: 'error',
+      reason: `refused NIP-05 target ${host} resolving to a private address`,
+    })
+    const sandbox = Sinon.createSandbox()
+    const proxies: TcpServer[] = []
+    let dnsLookup: Sinon.SinonStub
+    let server: http.Server
+    let redirectTo: string
+
+    const listen = (target: http.Server | TcpServer) =>
+      new Promise<void>((resolve, reject) => {
+        target.once('error', reject)
+        target.listen(0, '127.0.0.1', () => {
+          target.off('error', reject)
+          resolve()
+        })
+      })
+    const close = (target: http.Server | TcpServer) => new Promise((resolve) => target.close(resolve))
+
+    before(async () => {
+      server = http.createServer((req, res) => {
+        if (req.headers.host === 'first.example') {
+          res.writeHead(302, { location: redirectTo }).end()
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ names: { alice: pubkey } }))
+      })
+      await listen(server)
+    })
+
+    after(async () => {
+      await close(server)
+    })
+
+    beforeEach(() => {
+      // Clear proxy settings inherited from the shell, so a broken test can't reach a real proxy.
+      sandbox.replace(
+        process,
+        'env',
+        Object.fromEntries(Object.entries(process.env).filter(([name]) => !/proxy$/i.test(name))),
+      )
+      sandbox.replace(https, 'globalAgent', new https.Agent())
+      dnsLookup = sandbox.stub(dns.promises, 'lookup')
+      // Fail any lookup that skips the guard instead of querying real DNS.
+      const systemLookup: any = dns.lookup
+      sandbox
+        .stub(dns, 'lookup')
+        .callsFake((hostname: string, ...rest: any[]) =>
+          isIP(hostname) ? systemLookup(hostname, ...rest) : rest[rest.length - 1](new Error('system DNS used')),
+        )
+      // Never open a real TLS connection. Run the request's lookup first so guard errors still show;
+      // IP literals skip lookup, so refuse them directly.
+      const tlsConnect: any = tls.connect
+      sandbox.stub(tls, 'connect').callsFake((options: any, ...rest: any[]) => {
+        const literal = isIP(options.host ?? '') ? options.host : undefined
+        const lookup = (hostname: string, lookupOptions: object, callback: any) => {
+          if (literal) {
+            callback(new Error(`test refused to dial ${literal}`))
+            return
+          }
+          ;(options.lookup ?? dns.lookup)(hostname, lookupOptions, (error: Error | null) =>
+            callback(error ?? new Error(`test refused to dial ${hostname}`)),
+          )
+        }
+        return tlsConnect.call(tls, { ...options, host: literal ? 'literal.invalid' : options.host, lookup }, ...rest)
+      })
+    })
+
+    afterEach(async () => {
+      sandbox.restore()
+      await Promise.all(proxies.splice(0).map(close))
+    })
+
+    // Serve `hosts` from the local server after running the request's lookup;
+    // other hosts go to the real https.request.
+    const serveLocally = (hosts: string[]) => {
+      const hops: { hostname: string; resolved?: unknown }[] = []
+      const request = https.request
+      sandbox.stub(https, 'request').callsFake(((options: any, callback: any) => {
+        const hop: { hostname: string; resolved?: unknown } = { hostname: options.hostname }
+        hops.push(hop)
+        if (!hosts.includes(hop.hostname)) {
+          return request.call(https, options, callback)
+        }
+        options.lookup(hop.hostname, { all: true }, (error: Error | null, addresses: unknown) => {
+          hop.resolved = error ? error.message : addresses
+        })
+        const { port } = server.address() as AddressInfo
+        const headers = { ...options.headers, host: hop.hostname }
+        return http.request(
+          { host: '127.0.0.1', port, agent: false, method: options.method, path: options.path, headers },
+          callback,
+        )
+      }) as typeof https.request)
+      return hops
+    }
+
+    const startProxy = async () => {
+      const proxy = { connections: 0, url: '' }
+      const proxyServer = createTcpServer((socket) => {
+        proxy.connections += 1
+        socket.destroy()
+      })
+      proxies.push(proxyServer)
+      await listen(proxyServer)
+      proxy.url = `http://127.0.0.1:${(proxyServer.address() as AddressInfo).port}`
+      return proxy
+    }
+
+    it('refuses a host that resolves to a private address before connecting', async () => {
+      for (const addresses of [
+        [{ address: '127.0.0.1', family: 4 }],
+        [{ address: '::1', family: 6 }],
+        [{ address: 'fec0::1', family: 6 }],
+        [...publicAddresses, { address: '10.0.0.1', family: 4 }],
+      ]) {
+        dnsLookup.resolves(addresses)
+
+        const outcome = await verifyNip05Identifier('alice@internal.example', pubkey)
+
+        expect(outcome, JSON.stringify(addresses)).to.deep.equal(refused('internal.example'))
+      }
+      expect(dnsLookup).to.have.always.been.calledWith('internal.example')
+    })
+
+    it('refuses a redirect to a host that resolves to a private address', async () => {
+      redirectTo = 'https://internal.example/.well-known/nostr.json?name=alice'
+      const hops = serveLocally(['first.example'])
+      dnsLookup.resolves(publicAddresses)
+      dnsLookup.withArgs('internal.example').resolves([{ address: '192.168.1.10', family: 4 }])
+
+      const outcome = await verifyNip05Identifier('alice@first.example', pubkey)
+
+      expect(outcome).to.deep.equal(refused('internal.example'))
+      expect(hops).to.deep.equal([
+        { hostname: 'first.example', resolved: publicAddresses },
+        { hostname: 'internal.example' },
+      ])
+    })
+
+    it('still verifies through one redirect, handing every public address to the connection', async () => {
+      redirectTo = 'https://second.example/.well-known/nostr.json?name=alice'
+      const hops = serveLocally(['first.example', 'second.example'])
+      dnsLookup.resolves(publicAddresses)
+
+      const outcome = await verifyNip05Identifier('alice@first.example', pubkey)
+
+      expect(outcome).to.deep.equal({ status: 'verified' })
+      expect(hops).to.deep.equal([
+        { hostname: 'first.example', resolved: publicAddresses },
+        { hostname: 'second.example', resolved: publicAddresses },
+      ])
+    })
+
+    it('keeps the rest of a refused redirect URL out of the reason', async () => {
+      redirectTo = 'https://user:secret@100.100.100.200/latest/meta-data/?sig=token'
+      const hops = serveLocally(['first.example', '100.100.100.200'])
+      dnsLookup.resolves(publicAddresses)
+
+      const outcome = await verifyNip05Identifier('alice@first.example', pubkey)
+
+      expect(outcome).to.deep.equal({
+        status: 'error',
+        reason: 'Redirected request failed: refused redirect to unsafe target: https://100.100.100.200',
+      })
+      expect(hops.map((hop) => hop.hostname)).to.deep.equal(['first.example'])
+    })
+
+    it('ignores HTTPS_PROXY, which would resolve the host itself', async () => {
+      const proxy = await startProxy()
+      Object.assign(process.env, { HTTPS_PROXY: proxy.url, https_proxy: proxy.url })
+      dnsLookup.resolves([{ address: '127.0.0.1', family: 4 }])
+
+      const outcome = await verifyNip05Identifier('alice@internal.example', pubkey)
+
+      expect(outcome).to.deep.equal(refused('internal.example'))
+      expect(proxy.connections).to.equal(0)
+    })
+
+    it("ignores a proxy on Node's global agent (NODE_USE_ENV_PROXY)", async () => {
+      const proxy = await startProxy()
+      Object.assign(https, { globalAgent: new https.Agent({ proxyEnv: { HTTPS_PROXY: proxy.url } }) })
+      dnsLookup.resolves([{ address: '127.0.0.1', family: 4 }])
+
+      const outcome = await verifyNip05Identifier('alice@internal.example', pubkey)
+
+      expect(outcome).to.deep.equal(refused('internal.example'))
+      expect(proxy.connections).to.equal(0)
     })
   })
 })

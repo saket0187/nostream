@@ -1,3 +1,5 @@
+import { Agent } from 'node:https'
+import { isIP } from 'node:net'
 import axios, { AxiosError } from 'axios'
 import { z } from 'zod'
 
@@ -5,6 +7,7 @@ import { createLogger } from '../factories/logger-factory'
 import { Event } from '../@types/event'
 import { EventKinds } from '../constants/base'
 import { pubkeySchema } from '../schemas/base-schema'
+import { createSafeLookup, isBlockedAddress } from './safe-lookup'
 
 const logger = createLogger('nip05')
 
@@ -15,6 +18,10 @@ const MAX_RESPONSE_BYTES = 64 * 1024
 // their well-known under a redirect; unlimited would enable SSRF pivoting.
 const MAX_REDIRECTS = 1
 const DOMAIN_REGEX = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/
+const nip05Lookup = createSafeLookup('NIP-05')
+// Own agent: with NODE_USE_ENV_PROXY the global agent goes through a proxy,
+// which resolves the host itself and skips nip05Lookup.
+const nip05HttpsAgent = new Agent()
 
 // Public defaults used by callers when settings omit these fields. Exported so the
 // runtime defaults stay in one place and are easy to unit test.
@@ -95,8 +102,9 @@ export function extractNip05FromEvent(event: Event): string | undefined {
 
 /**
  * Reject redirect targets that would turn this endpoint into an SSRF primitive:
- * non-https schemes, loopback, link-local, and RFC1918 private ranges.
- * Domain-based checks (e.g. `localhost`) are included for belt-and-suspenders.
+ * non-https schemes, non-public IPv4 literals, and IPv6 literals. Domain-based
+ * checks (e.g. `localhost`) are included for belt-and-suspenders; hostnames are
+ * checked again by nip05Lookup when they resolve.
  */
 function isRedirectTargetSafe(targetUrl: string): boolean {
   let parsed: URL
@@ -115,22 +123,9 @@ function isRedirectTargetSafe(targetUrl: string): boolean {
     return false
   }
 
-  // IPv4 literal check. Covers loopback (127/8), private ranges (10/8, 172.16/12,
-  // 192.168/16), link-local (169.254/16), and multicast/reserved (>=224).
-  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
-  if (ipv4) {
-    const [a, b] = ipv4.slice(1, 3).map(Number)
-    if (
-      a === 10 ||
-      a === 127 ||
-      a === 0 ||
-      a >= 224 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168)
-    ) {
-      return false
-    }
+  // Node skips `lookup` for an IP literal, so check it here.
+  if (isIP(host) === 4 && isBlockedAddress(host)) {
+    return false
   }
 
   // IPv6 literal: reject any bracketed v6 address; NIP-05 hosts are domain names.
@@ -139,6 +134,16 @@ function isRedirectTargetSafe(targetUrl: string): boolean {
   }
 
   return true
+}
+
+// Keep only scheme and host: the rest of the URL may carry credentials.
+function describeRedirectTarget(targetUrl: string): string {
+  try {
+    const { protocol, host } = new URL(targetUrl)
+    return `${protocol}//${host}`
+  } catch {
+    return 'an invalid URL'
+  }
 }
 
 export async function verifyNip05Identifier(nip05: string, pubkey: string): Promise<Nip05VerificationOutcome> {
@@ -161,12 +166,16 @@ export async function verifyNip05Identifier(nip05: string, pubkey: string): Prom
       maxRedirects: MAX_REDIRECTS,
       maxContentLength: MAX_RESPONSE_BYTES,
       maxBodyLength: MAX_RESPONSE_BYTES,
+      // No proxy, so nip05Lookup checks every host, redirects included.
+      proxy: false,
+      httpsAgent: nip05HttpsAgent,
+      lookup: nip05Lookup,
       // `beforeRedirect` is forwarded to follow-redirects by axios. Any throw
       // here aborts the request with that error, which we catch below.
       beforeRedirect: (options: { href?: string; protocol?: string; hostname?: string }) => {
         const href = options.href ?? `${options.protocol ?? ''}//${options.hostname ?? ''}`
         if (!isRedirectTargetSafe(href)) {
-          throw new Error(`refused redirect to unsafe target: ${href}`)
+          throw new Error(`refused redirect to unsafe target: ${describeRedirectTarget(href)}`)
         }
       },
     })

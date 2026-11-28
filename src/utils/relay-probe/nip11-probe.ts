@@ -1,9 +1,8 @@
-import { lookup as dnsLookup } from 'node:dns/promises'
-import { BlockList, isIP } from 'node:net'
 import axios, { AxiosError } from 'axios'
 import { z } from 'zod'
 
 import { pubkeySchema } from '../../schemas/base-schema'
+import { createSafeLookup, isBlockedAddress } from '../safe-lookup'
 import { Nip11Result } from './types'
 
 const MAX_RESPONSE_BYTES = 256 * 1024
@@ -43,68 +42,9 @@ export interface Nip11Fetcher {
   fetch(url: string, timeoutMs: number): Promise<Nip11Result>
 }
 
-const blockedNip11Addresses = new BlockList()
-blockedNip11Addresses.addSubnet('0.0.0.0', 8, 'ipv4')
-blockedNip11Addresses.addSubnet('10.0.0.0', 8, 'ipv4')
-blockedNip11Addresses.addSubnet('100.64.0.0', 10, 'ipv4')
-blockedNip11Addresses.addSubnet('127.0.0.0', 8, 'ipv4')
-blockedNip11Addresses.addSubnet('169.254.0.0', 16, 'ipv4')
-blockedNip11Addresses.addSubnet('172.16.0.0', 12, 'ipv4')
-blockedNip11Addresses.addSubnet('192.0.0.0', 24, 'ipv4')
-blockedNip11Addresses.addSubnet('192.0.2.0', 24, 'ipv4')
-blockedNip11Addresses.addSubnet('192.168.0.0', 16, 'ipv4')
-blockedNip11Addresses.addSubnet('198.18.0.0', 15, 'ipv4')
-blockedNip11Addresses.addSubnet('198.51.100.0', 24, 'ipv4')
-blockedNip11Addresses.addSubnet('203.0.113.0', 24, 'ipv4')
-blockedNip11Addresses.addSubnet('224.0.0.0', 4, 'ipv4')
-blockedNip11Addresses.addSubnet('240.0.0.0', 4, 'ipv4')
-blockedNip11Addresses.addSubnet('::', 128, 'ipv6')
-blockedNip11Addresses.addSubnet('::1', 128, 'ipv6')
-blockedNip11Addresses.addSubnet('2001:db8::', 32, 'ipv6')
-blockedNip11Addresses.addSubnet('fc00::', 7, 'ipv6')
-blockedNip11Addresses.addSubnet('fe80::', 10, 'ipv6')
-blockedNip11Addresses.addSubnet('ff00::', 8, 'ipv6')
+export const isBlockedNip11Address = isBlockedAddress
 
-const normalizeResolvedAddress = (address: string): string => {
-  const lower = address.toLowerCase()
-  const mapped = lower.startsWith('::ffff:') ? lower.slice('::ffff:'.length) : lower
-
-  return isIP(mapped) === 4 ? mapped : lower
-}
-
-export const isBlockedNip11Address = (address: string): boolean => {
-  const normalized = normalizeResolvedAddress(address)
-  const family = isIP(normalized)
-
-  if (family === 4) {
-    return blockedNip11Addresses.check(normalized, 'ipv4')
-  }
-
-  if (family === 6) {
-    return blockedNip11Addresses.check(normalized, 'ipv6')
-  }
-
-  return true
-}
-
-/**
- * Resolve a NIP-11 host and refuse private/loopback/link-local results before
- * the socket connects. String-only URL checks miss hostnames whose A/AAAA
- * records point inward, including DNS rebinding after the literal check.
- */
-export const safeNip11Lookup = async (
-  hostname: string,
-  options: object,
-): Promise<{ address: string; family: number }[]> => {
-  const result = await dnsLookup(hostname, { ...(options as any), all: true })
-  const addresses = Array.isArray(result) ? result : [result]
-
-  if (addresses.some((entry) => isBlockedNip11Address(entry.address))) {
-    throw new Error(`refused NIP-11 target ${hostname} resolving to a private address`)
-  }
-
-  return addresses
-}
+export const safeNip11Lookup = createSafeLookup('NIP-11')
 
 /**
  * Reject redirect targets that would turn relay probing into an SSRF primitive.
